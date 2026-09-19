@@ -1220,6 +1220,38 @@ structure was being scored against the wrong cells.
 Numbers are not comparable to §6b's ~89 % / ~51 %: different tolerance, and recall
 there was not restricted to observed surfaces.
 
+### Correction (2026-09-18): "node stamps match no dataset" is wrong
+
+Caveat 1 above is half right. The ground truth **was** a different run from the one
+that built the database -- that part stands. But the parenthetical claim that
+`map_tiny.db`'s node stamps "match no dataset" is false, and it cost a day of
+reasoning in the wrong direction.
+
+All 30 nodes fall inside the sim-time interval of `dataset/dataset_map_tiny`, and
+they are that run's trajectory. Applying the measured placement (1.85, 8.60, −90)
+to the stored node poses puts them a median of **0.069 m** from that bag's
+ground-truth route, and — the discriminating test — a median of **0.340 m**
+(max 0.52 m) from the ground-truth pose carrying the *same* timestamp. A different
+run over the same loop would agree in space but not in time. The wrong-sign yaw
+gives 19 m, so the test does discriminate. The two routes are also visibly
+different: `dataset_static_tiny_repeat` is a single oval circuit, `dataset_map_tiny`
+a figure-eight through the centre.
+
+**Why the original claim looked true.** A bag's `messages.timestamp` column is the
+wall-clock *receive* time, while node stamps and message *header* stamps are
+simulation time. Comparing the two gives an offset of ~1.8e9 s and the appearance
+that nothing matches. Compare header stamps to node stamps, never row timestamps.
+
+**Consequence.** `dataset_map_tiny` is not an equivalent substitute for the lost
+ground-truth run. Re-running `validate_map.py` against it returns **100.0 % clear
+and 0.0 % false obstacle** — the map cannot contradict the trajectory it was built
+from — against 99.3 % / 0.7 % for the independent run. The 0.7 % is exactly what
+only an unseen route can expose, and the 0.0 % must not be quoted as map quality.
+Both runs are recorded in `output/compare/rtab_map_vs_gt_metrics.csv`, with the
+second figure as `rtab_map_vs_gt_selfcheck.png`. Note that the evaluator prints
+"Ground truth is a DIFFERENT run" unconditionally, so that footer is wrong on the
+self-check figure.
+
 ### What a rigid placement cannot fix
 
 Residual error in the overlay is RTAB-Map's own internal distortion — walls doubled
