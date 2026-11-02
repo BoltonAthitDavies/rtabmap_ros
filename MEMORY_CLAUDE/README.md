@@ -1261,6 +1261,303 @@ navigation, not the placement.
 
 ---
 
+## 7c. `loop_closure:=false` -- a pure odometry chain (2026-10-26)
+
+Added to `rtab_sim.launch.py` after the realistic-map A/B showed the front-end's
+own closures were what corrupted an otherwise ~0.1 m map (ORB `loopClosing: 0`
+took `_map` 2.01 -> 0.07 m, `_mapv2` 8.82 -> 0.10 m). The matching switch on the
+back-end side lets a map be built with NO closures anywhere, so the grid is a
+direct picture of odometry drift and the stitched map has something to be
+compared against.
+
+Two parameters, chosen so the database stays localisable:
+
+| parameter | value | effect |
+|---|---|---|
+| `Rtabmap/LoopThr` | 1.0 | Bayes hypothesis is a probability; never crossed, so no appearance closure is ever accepted |
+| `RGBD/ProximityBySpace` | false | no proximity links between nodes close in space |
+
+`Kp/MaxFeatures` is deliberately left alone. Setting it to -1 would also stop
+detection, and more cheaply, but it stops extraction too: the database would hold
+no visual words and `mode:=localize` against it could never relocalise. With
+`LoopThr 1.0` the words are still stored and only the acceptance is suppressed.
+It is noted as a commented alternative in `_loop_closure_params()`.
+
+Verified by resolving the launch description both ways: with the default the
+rtabmap node's parameter set is byte-identical to before; with `false` exactly
+the two parameters above are appended. Not yet run on a bag.
+
+---
+
+## 7d. Real rig: `camera_model:=fisheye` (2026-10-28)
+
+§8's "the real rig cannot use this path" is retired. Both blockers moved:
+the extrinsic is now a frozen stereo calibration (28 Oct, `camera_parameters_271026/281026*.dat`,
+89.0 mm / 0.86 deg, written into `vins_fusion_ros2/config/wil/stereo_imu.yaml` in
+inverse form), and the fisheye problem is solved by rectifying in the shim.
+
+**What the real bag carries** (`dataset/dataset_realv5_000`, 134.6 s, recorded
+28 Oct 15:31, i.e. AFTER the remount so the live extrinsic applies): stereo JPEG
+`/cam{0,1}/image_raw/compressed` at 30 Hz, 1920x1080 mono, pair stamps within 4 ms;
+`/clock` recorded (so NO `--clock`, same as sim); IMU on `/hwt101ct_yaw_publisher`;
+no `camera_info`, no TF, no ground-truth topic (GT is the tracker file under
+`dataset/gt`). `script/check_stereo_side.py`: 12/12 pairs negative, **cam1 is LEFT**.
+
+**The shim's fisheye path** (`rtab_camera_shim.py`, `build_fisheye_rectification()`):
+reads `cam{0,1}_fisheye.yaml` (KANNALA_BRANDT, VINS k2..k5 = OpenCV fisheye k1..k4;
+cam1 reuses cam0's intrinsics because only one mono calibration exists) and
+`stereo_imu.yaml`, takes R1/R2 from `cv2.fisheye.stereoRectify`, builds the
+projection matrices BY HAND from `hfov_deg`, remaps both frames each tick, and
+publishes `camera_info` + static TF to `cam{L}_rect_optical` / `cam{R}_rect_optical`
+with `body_T_rect = body_T_cam * R^T`.
+
+Three things it checks at startup, all of which failed silently at least once
+while being written:
+
+1. **`left_cam` against the extrinsic**: the other camera must sit at +x in the
+   left optical frame. `left_cam:=0` exits with "cam1 sits at x=-0.0890 m".
+2. **The rectified pair is canonical**: `rect_L_T_rect_R` must be `(B, 0, 0)` with
+   identity rotation to 1e-6. This ties the maps and the TF together; measured
+   `(0.0890, -0.0, -0.0)`.
+3. **Comments are stripped before parsing** `stereo_imu.yaml`. The real config keeps
+   five retired calibrations as commented blocks with the SAME `body_T_cam1:` key,
+   and the regex parser (written for the sim file, which has none) returned the
+   first one -- the pre-remount cam1 at **+0.0936 m**. The side check is what
+   caught it. The sim values are unchanged by the fix.
+
+`cv2.fisheye.stereoRectify`'s own P matrices are unusable for this lens: with
+`balance=0` it returned **fx = 0.0** (a ~180 deg fisheye's corners map to infinity).
+Only its rotations are used.
+
+**Choosing `hfov_deg`.** Depth error per pixel of disparity is z^2 / (fx*B):
+
+| hfov | fx (px) | fx*B (px*m) | cross-checked ORB matches on the epipolar line |
+|---|---|---|---|
+| 90 | 960 | 85.5 | 32-38 % |
+| **110** | **672** | **59.8** | **49-58 %** |
+| 130 | 448 | 39.9 | 66-74 % |
+
+110 reproduces the sim's budget (59.9) and is the default. The match fraction
+rises with FOV only because more of the fisheye survives; the inlier depth
+estimate is the same at every focal length (2.3 / 3.5 / 4.6 m on the same three
+frames), which is the check that the geometry is right rather than lucky.
+
+**Offline epipolar check through the shim's own maps**, six frames across the
+bag, 6689 inliers: vertical residual mean **-0.58 px**, |dy| p90 **1.73 px**,
+disparity always positive. The residual bias is plausibly cam1 borrowing cam0's
+intrinsics. Figures in the session scratchpad only (`realv5_rect_hfov*.png`).
+
+**Live smoke test** (shim alone + `ros2 bag play dataset/dataset_realv5_000`, 25 s):
+left `cam1_rect_optical` bgr8 1920x1080, right `cam0_rect_optical` mono8;
+`camera_info` fx 672.2, cx 960, cy 540, right `P[0][3]` = -59.844; `tf_static`
+`imu_link -> cam1_rect_optical` t = (-0.0890, -0.0012, -0.0023) and `-> cam0_rect_optical`
+at the origin, both with the same quaternion. **Throughput: ~1 Hz effective at
+`rate:=4.0`** -- two 1080p JPEG decodes + two remaps + 6 MB bgr8 per pair is
+heavier than the sim's 720p path (3.2 Hz). Play the bag at `--rate 0.5` or lower
+for mapping, or accept ~1 keyframe/s.
+
+**Launch for the real rig** (ORB front-end, `wil_stereo_imu.launch.py`, publishes
+`orbslam3_world -> imu_link`; ORB's `IMU.T_b_c1` equals VINS's `body_T_cam0`, so
+`imu_link` IS the frame the shim's extrinsics are expressed in):
+
+```bash
+ros2 launch ./rtabmap_ros/rtab_sim.launch.py mode:=construct rviz:=true \
+    camera_model:=fisheye left_cam:=1 hfov_deg:=110 \
+    config_dir:=$HOME/wil_project/vins_fusion_ros2/config/wil \
+    odom_frame:=orbslam3_world body_frame:=imu_link \
+    ground_height:=<IMU height above floor, NEGATIVE, plus ~0.1> \
+    output_path:=map/real/ database_path:=map/real/real.db \
+    grid_range_max:=6.0 detection_rate:=4.0 shim_rate:=4.0 loop_closure:=false
+# ros2 bag play dataset/dataset_realv5_000 --rate 0.5       (no --clock)
+```
+
+**Running it without starving ORB (2026-10-29).** ORB + shim + rtabmap do not fit
+on this laptop together at 1080p (the sim had the same problem with VINS, §6d).
+Two levers, use both:
+
+1. **Two passes, replaying ORB's trajectory.** `script/gt_tf_publisher.py` reads the
+   11-column `vio.csv` ORB writes (`trajectory_writer.cpp`: t_ns, xyz, qw qx qy qz,
+   v), interpolates at `/clock`, and broadcasts it as TF -- so pass 1 is ORB alone
+   at whatever rate it sustains, pass 2 is the bag + replayed TF + shim + rtabmap
+   with ORB's whole CPU budget freed. Deterministic, A/B-able, and the realv5 ORB
+   runs under `output/output_orb/real/realv5_*` already exist. Caveat: the
+   interpolation bridges tracking gaps with a straight line, so pick a run with
+   no losses.
+2. **`rect_scale:=0.5`** (shim + launch arg, added today): rectified output at
+   960x540, fx 336, fx*B 29.9. RTAB-Map's SGBM cost scales with pixels x disparity
+   range, so this is the single biggest back-end saving; the 5 cm grid loses nothing
+   visible. Pair with `detection_rate:=1.0` on the real rig.
+
+**The ORB node's world on the real rig is the camera optical frame, not z-up
+(2026-10-29).** First pass-2 attempt in RViz: floor plane ~90 deg off, no grid.
+Analysed all six realv5 `vio.csv`: body y (physically up) -> world **-y** for the
+whole run, trajectory plane normal = world y. The node publishes the ACTIVE map's
+frame, which is the camera at map creation (x right, y down, z forward); the sim
+only looked REP-103 because `align_first_pose` + an FLU IMU body made it so. There
+is also a ~1 s transient after IMU init (91 deg flip at csv t=2.5 s and back at
+2.8 s) and some runs flip again on a map reset (besteffort at 105.9 s). The ORB
+Pangolin viewer is unaffected -- it draws its own gravity-aligned world -- which is
+why "the viewer looks right" is not evidence about the TF.
+
+Fixed in `script/gt_tf_publisher.py` (ground-truth replay unchanged by default):
+`world_fix:=optical_to_flu` left-multiplies every pose by x'=z, y'=-x, z'=-y, and
+`start_time:=3.5` drops the transient and sends NO TF until then (RTAB-Map waits
+rather than anchoring its map in the wrong frame). Verified on
+`realv5_imu_cbgroup_reliable_r05_newIMU_TO_CAM_TF`: after the fix body up -> +z
+(|dev| < 0.04), plane normal (0.01, -0.03, -1), z extent 0.15 m over 130 s.
+Forward is +x, right is -y. Use that run: 1366 rows, tracking state 2 throughout,
+no reset after the transient.
+
+**"No map at all" = a 0-node database = the shim died at startup (2026-10-29).**
+`map/real/real.db` after the user's first full run: 0 nodes, 0 links, 0 Data rows.
+Reproduced: the launch handed the shim `-p hfov_deg:=110` (the DeclareLaunchArgument
+default is the string '110'), rclpy parsed it as INTEGER, and `declare_parameter`
+of a DOUBLE with an integer override throws -- the shim's traceback scrolls past in
+the launch output, rtabmap starts fine and simply never receives data. My earlier
+live smoke test had typed `110.0` by hand, which is why it passed. Fix: the launch
+now formats `hfov_deg`/`rect_scale` as floats AND the shim declares both with
+`ParameterDescriptor(dynamic_typing=True)`. **Rule: a 0-node db means the input
+chain is dead; read the shim's lines in the launch log before anything else.**
+
+Rerun of the same pass-2 command on 55 s of `dataset_realv5_000` (bag on the flash
+drive now): 29 nodes, 56 neighbour + 29 gravity links, every node with ground and
+obstacle cells (median 22.6 kB obstacle / 1.5 kB ground); one TF-extrapolation
+warning at the first frame only. Exported grid 263x240 at 5 cm: walls and the
+corner the robot turned are visible, with the usual ray-tracing streaks from far
+points. The static TF used a placeholder IMU height of 0.30 m.
+
+**Second 0-node run, same symptom, different cause: frames with no odometry TF
+yet (2026-10-29, later).** After the shim fix the user's run STILL had 0 nodes, and
+so did three of my reproductions while one succeeded -- i.e. timing-dependent.
+Mechanism, from the warning timeline: `start_time:=3.5` meant the replay sent NO
+TF for the bag's first ~5.5 s, but the shim published pairs from the first frame.
+RTAB-Map blocks `wait_for_transform` (5 s, wall) on EACH such frame inside its
+subscription callback, serially; the ~11 pre-TF pairs cost ~55 s of blocking while
+`topic_queue_size` 200 buffers everything behind them; by the time those are
+drained their stamps are 20+ s behind sim time, outside the 10 s TF buffer ->
+"Lookup would require extrapolation into the past" -> dropped -> and so on. The
+console alternates "Did not receive data since 5 seconds" with one throttled
+getTransform warning every 10 s. Neither `rviz:=true` nor `output_path` was the
+cause (A/B'd both alone: 0 nodes each); they only shifted the timing.
+
+Fix in `script/gt_tf_publisher.py`: `hold_before_start` (default true) broadcasts
+the first KEPT pose from the moment /clock runs, so there is never a frame without
+odometry. Valid because the robot is stationary through ORB's init transient
+(csv positions constant until ~5 s). `hold_before_start:=false` restores the gap.
+Verified with the user's exact arguments (rviz + output_path): 17 nodes in 45 s
+of bag, all with grid cells, `/mapPath` written (13 rows).
+
+**Rule for the next time the map is empty:** open the database and count nodes.
+0 nodes = the input chain, in this order: shim traceback at startup; shim lag line
+("N pairs; lag +X s"); rtabmap "Did not receive data" / getTransform warnings.
+Nodes present but no grid = a Grid/* or base-frame problem instead.
+
+**Process-cleanup trap that contaminated the later A/Bs.** `kill <pid of 'ros2 run
+...'>` kills the Python wrapper and leaves the real `static_transform_publisher`
+binary alive; `kill -9` on a `ros2 launch` PID orphans its children (shim, writer).
+By the fourth reproduction two orphan shims were publishing `/stereo/*` alongside
+the live one (rtabmap logged "Messages ... arrived out of order"; shim 4570 ms/pair,
+RTAB-Map update 4.0-4.9 s vs 0.16-0.27 s clean) and the CPU sat at 92 °C /
+0.8-1.3 GHz. Start test processes with `setsid` and kill the process group
+(`kill -INT -- -<pgid>`), and check `ps -eo pid,ppid,lstart,args | grep shim`
+before trusting any timing. The user's own `republish compressed raw` x2 and
+`image_encoding_fixer` x2 from 16:37 were also still alive, decoding both 1080p
+streams at 30 Hz during every bag replay.
+
+**realv6 (2026-11-02): the replay settings are RUN-DEPENDENT, so they are now
+measured from the csv.** With `world_fix:=optical_to_flu start_time:=3.5` the
+realv6 map built (grid + cloud) but pose/TF were wrong. The realv6 ORB run
+(`loopclosing_rate1`, LC on but 418/418 place-recognition no_candidate, so no
+closure jumps) has its transient until **9.5 s** (jumps at 2.5/2.6/5.3/5.4/9.5 s)
+and afterwards is already **gravity-aligned z-up** (body up -> +z, plane normal
+-z); the fixed optical_to_flu rotation then tipped a correct world onto its side,
+and 3.5 s was inside the transient. `gt_tf_publisher.py` gained
+`world_fix:=auto` (rotate so the mean body-up axis -- `body_up`, default (0,1,0)
+for this IMU frame -- becomes +z; yaw kept; also levels a constant mount pitch)
+and `start_after_transient:=true` (0.5 s after the last >45 deg jump in the first
+30 s). Offline: realv5 newTF -> 90.8 deg rotation, start 3.3 s (= the hand-tuned
+values); realv6 -> 0.5 deg, start 10.0 s. Spread of the body-up axis over each run
+is 1.7 / 2.8 deg p95, i.e. the floor is flat enough for the levelling to be real.
+Use these two options for every replay from now on; the fixed ones stay for sim GT.
+
+**realv6 dense map unidentifiable = the rig moved; the 28 Oct extrinsic no longer
+rectifies it (2026-11-02).** `map/real/real.db` (realv5, triangle route) shows cars;
+`map/real_311026_rate05_lc/` (realv6, 8-shape) is a radial smear. Ruled out first:
+not the stored calibration (both dbs carry the same 960x540 pair and encoding), not
+the 44 accepted closures (median correction 0.14 m, max 0.67 m; the odometry-only
+re-export of the same db is the identical smear), not scene distance (realv6 points
+are nearer the path, p50 1.5 m vs 2.1 m), not image quality (brightness, sharpness
+equal). The discriminator was epipolar alignment of the STORED rectified pairs:
+realv5 79-87 % of cross-checked ORB matches within 2 px of the line, realv6
+**7-22 %** with a -1.2 px median residual. SGBM at blockSize 15 cannot match
+across that, so every pixel's depth is noise along its ray = the smear. On the raw
+bags with every chequerboard calibration on disk (10-21, 10-26, 10-27, 10-27_01,
+10-28): best on realv6 is 15 % (10-27), 10-28 gives 1 % (dy -6 px) where it gives
+46 % on realv5. **The baseline direction moved 6.3 deg between 28 Oct and 31 Oct** (realv6 was recorded 31 Oct 19:00; its node stamps say so, the `311026` dir names are the recording date)
+(rotation only 0.45 deg) -- a mount change, same class of event as 10-19 and 10-28.
+ORB was NOT visibly hurt (map inliers median 883 vs 735 on realv5): its
+KannalaBrandt stereo path triangulates with a looser check, so a good ORB
+trajectory is no evidence that the extrinsic still rectifies.
+
+`script/stereo_selfcal.py` (new): essential matrix over fisheye-undistorted ORB
+matches from ~8 frames gives R and the baseline DIRECTION; the length is copied
+from a reference .dat (unobservable from images). Validated on realv5: 0.2 deg
+from the 28 Oct rotation, on-line 46 -> 77 %. On realv6: on-line 1 -> 43 % on raw
+frames, and a map rebuilt with it (`vins_fusion_ros2/config/wil_311026_selfcal/stereo_imu.yaml`,
+inverse-form derivation, baseline 89.0 mm) stores pairs at **84 % on-line**, SGBM
+valid 62 %, 36 nodes in 45 s, update 0.31 s; the top view shows wall lines and
+object outlines again, with residual ray streaks (self-cal still leaves a ~1 px
+vertical bias -- a chequerboard calibration should do better). The candidate .dat is
+`camera_parameters_311026_selfcal/311026camera1_rot_trans_selfcal.dat` -- a stopgap until a chequerboard
+calibration of the current mount; NOT written into config/wil (user manages the
+calibration history there).
+
+**Rule:** before trusting any real-rig map, run
+`python3 script/stereo_selfcal.py <bag> --ref <live .dat>`; under ~30 % on-line the
+dense map will be noise whatever RTAB-Map does.
+
+**Measured stereo depth noise vs range on the real rig (2026-11-02).** Floor-plane
+fit on SGBM depth of stored 960x540 pairs (rect_scale 0.5, fx*B = 29.9), median
+|residual| per range bin, several nodes each:
+
+| range | realv5 (28 Oct, good) | realv6 self-cal | realv6 misrectified | 1 px theory |
+|---|---|---|---|---|
+| 0.5-1 m | 0.9 cm | 4.1 cm | 3.3 cm | 2 cm |
+| 1-1.5 m | 2.6 cm | 6.3 cm | 5.6 cm | 5 cm |
+| 1.5-2 m | 6.5 cm | 4.9 cm | 12.6 cm | 10 cm |
+| 2-3 m | 6.6 cm | 7.0 cm | 29.5 cm | 21 cm |
+| 3-4 m | 13.8 cm | 13.4 cm | 32.6 cm | 41 cm |
+| 4-6 m | 60.8 cm | 24.6 cm | 72.2 cm | 84 cm |
+
+So at half scale the depth is grid-cell accurate (<= 5 cm) only to ~1.5 m and
+within the 25 cm scoring tolerance to ~3-4 m; past 4 m it is worse than half a
+metre even with a good calibration. The user's "about 1 m" instinct is right for
+the 5 cm cell. `grid_range_max:=6.0` is too generous for the real rig at
+rect_scale 0.5 -- use ~3 m, or rect_scale 1.0 to stretch each bound by ~1.4x. The
+self-cal's ~1 px vertical bias shows as the worse near-range numbers (4 vs 1 cm);
+the misrectified column is 2-4x worse at 2-4 m, which is the smear.
+
+**`imu_link` is NOT a usable base frame.** ORB's `IMU.T_b_c1` = diag(1,-1,-1) makes
+`imu_link` x-right, y-UP, z-BACKWARD, and `Grid/MaxGroundHeight` is measured along
+base_frame z. Publish a FLU `base_link` under it and pass `base_frame:=base_link`:
+
+    ros2 run tf2_ros static_transform_publisher --x 0 --y -<IMU height m> --z 0 \
+        --roll 0 --pitch 1.5708 --yaw 1.5708 --frame-id imu_link --child-frame-id base_link
+
+(R = Rz(90)Ry(90): base forward = -z_imu, left = -x_imu, up = +y_imu, verified
+numerically.) Then `ground_height` keeps its sim meaning (~0.1 above the floor).
+
+Not yet done: `ground_height` for the real rig is unknown (the IMU's height above
+the floor has not been measured; the sim's 0.29 is in `base_footprint` terms), the
+real ORB config has `loopClosing: 1` (set 0 for the closure-free map, back to 1
+to load the Atlas), and no RTAB-Map database has been built from real imagery
+yet. The pinhole path was NOT re-run live after this change (no sim bag on the
+local disk); it was verified by parameter resolution (byte-identical shim
+arguments plus the three new ones at their defaults) and by re-parsing the sim
+extrinsics (unchanged).
+
+---
+
 ## 8. Open items
 
 **Where the two scripts live.** They are currently inside this fork
@@ -1269,7 +1566,8 @@ almost certainly wrong: they are WiL project code, not upstream RTAB-Map code,
 and will collide or be lost on any upstream merge. The workspace convention puts
 helpers in `script/`. Unresolved.
 
-**The real rig cannot use this path.** `config/wil/cam0_fisheye.yaml` is a
+**The real rig cannot use this path -- RETIRED 2026-10-28, see §7d.** The
+original reasoning, kept for the record: `config/wil/cam0_fisheye.yaml` is a
 `KANNALA_BRANDT` ~180° fisheye at 1920×1080. RTAB-Map's stereo pipeline assumes a
 rectified pinhole pair and has no equidistant model — VINS can consume it, RTAB-Map
 cannot. Rectifying to a ~90–100° virtual pinhole discards the periphery, which is

@@ -123,6 +123,35 @@ def _mode_params(mode, read_only):
     return params
 
 
+def _loop_closure_params(enabled):
+    """loop_closure:=false turns RTAB-Map into a pure odometry chain.
+
+    Two detectors can add a non-neighbour link: the appearance-based one (Bayes
+    filter over visual words, accepted when the hypothesis exceeds
+    Rtabmap/LoopThr) and the proximity one (RGBD/ProximityBySpace, nodes close
+    in space in the working memory). Both are shut here, so the graph is exactly
+    the front-end's odometry and the grid is assembled from it uncorrected.
+
+    Visual words are still EXTRACTED (Kp/MaxFeatures untouched) so the database
+    keeps its signatures and remains usable for mode:=localize and for
+    rtabmap-reprocess. The cheaper alternative, 'Kp/MaxFeatures': '-1', disables
+    extraction altogether and yields a database that can never relocalise.
+
+    Why want this: on the realistic mapping bags the front-end's own closures
+    were what corrupted an otherwise ~0.1 m map (see loopClosing: 0 in the ORB
+    config and MEMORY_CLAUDE). With both front-end and back-end closures off the
+    map is a direct picture of odometry drift, the A/B against the stitched map.
+    """
+    if enabled:
+        return {}
+    return {
+        # Bayes posterior is a probability; a threshold of 1.0 is never crossed.
+        'Rtabmap/LoopThr': '1.0',
+        # 'Kp/MaxFeatures': '-1',   # option A: no words at all, cannot localize
+        'RGBD/ProximityBySpace': 'false',
+    }
+
+
 def launch_setup(context, *args, **kwargs):
     mode = LaunchConfiguration('mode').perform(context).lower()
     if mode not in ('construct', 'extend', 'localize'):
@@ -133,6 +162,8 @@ def launch_setup(context, *args, **kwargs):
     base_frame = LaunchConfiguration('base_frame').perform(context) or body_frame
     ground_height = LaunchConfiguration('ground_height').perform(context)
     optimize_max_error = LaunchConfiguration('optimize_max_error').perform(context)
+    loop_closure = LaunchConfiguration('loop_closure').perform(context).lower() in (
+        'true', '1', 'yes')
     read_only = LaunchConfiguration('read_only').perform(context).lower() in (
         'true', '1', 'yes')
     database = os.path.expanduser(LaunchConfiguration('database_path').perform(context))
@@ -159,6 +190,12 @@ def launch_setup(context, *args, **kwargs):
     detection_rate = LaunchConfiguration('detection_rate').perform(context)
     shim_rate = LaunchConfiguration('shim_rate').perform(context)
     config_dir = LaunchConfiguration('config_dir').perform(context)
+    camera_model = LaunchConfiguration('camera_model').perform(context).lower()
+    left_cam = LaunchConfiguration('left_cam').perform(context)
+    hfov_deg = LaunchConfiguration('hfov_deg').perform(context)
+    rect_scale = LaunchConfiguration('rect_scale').perform(context)
+    if camera_model not in ('pinhole', 'fisheye'):
+        raise RuntimeError(f"camera_model must be pinhole|fisheye, got {camera_model!r}")
 
     # database_path must name a FILE. RTAB-Map is launched with -d, which erases
     # whatever that path names before starting, so pointing it at a run directory
@@ -172,8 +209,14 @@ def launch_setup(context, *args, **kwargs):
     print(f'[rtab_sim] mode     = {mode}'
           + ('  (read-only)' if (read_only and mode == 'localize') else ''))
     print(f'[rtab_sim] odom     = TF {odom_frame} -> {body_frame}')
+    if not loop_closure:
+        print('[rtab_sim] loop closure OFF: pure odometry chain (LoopThr 1.0, '
+              'ProximityBySpace false; visual words still extracted)')
     print(f'[rtab_sim] base     = {base_frame}   ground_height = {ground_height}')
     print(f'[rtab_sim] body     = {body_frame}')
+    print(f'[rtab_sim] cameras  = {camera_model}  config_dir = {config_dir}'
+          + (f'  left_cam = {left_cam}  hfov = {hfov_deg} deg  rect_scale = {rect_scale}'
+             if camera_model == 'fisheye' else ''))
     print(f'[rtab_sim] database = {database}')
     print(f'[rtab_sim] output   = {output_path or "(none -- no vio.csv written)"}')
 
@@ -184,6 +227,12 @@ def launch_setup(context, *args, **kwargs):
              '-p', f'body_frame:={body_frame}',
              '-p', f'config_dir:={config_dir}',
              '-p', f'rate:={shim_rate}',
+             '-p', f'camera_model:={camera_model}',
+             '-p', f'left_cam:={left_cam}',
+             # Always hand these over as floats: a bare '110' would be parsed
+             # as an integer and rejected by the shim's DOUBLE parameter.
+             '-p', f'hfov_deg:={float(hfov_deg)}',
+             '-p', f'rect_scale:={float(rect_scale)}',
              '-p', 'namespace:=/stereo'],
         output='screen')
 
@@ -348,7 +397,7 @@ def launch_setup(context, *args, **kwargs):
             # with zero closures. Upstream's own multisession demo raises this to
             # 10 for the same reason.
             'RGBD/OptimizeMaxError': optimize_max_error,
-        }] + [_mode_params(mode, read_only)],
+        }] + [_mode_params(mode, read_only), _loop_closure_params(loop_closure)],
         remappings=[
             ('left/image_rect', '/stereo/left/image_rect'),
             ('right/image_rect', '/stereo/right/image_rect'),
@@ -422,6 +471,14 @@ def generate_launch_description():
                         'proposes; upstream multisession uses 10. Raising it '
                         'accepts larger corrections -- and larger mistakes.'),
         DeclareLaunchArgument(
+            'loop_closure', default_value='true',
+            description='false disables RTAB-Map loop closure detection '
+                        '(Rtabmap/LoopThr 1.0, RGBD/ProximityBySpace false) so '
+                        'the graph is a pure odometry chain. Visual words are '
+                        'still extracted, so the database stays usable for '
+                        'mode:=localize. Pair with loopClosing: 0 in the ORB '
+                        'config for a map that shows only odometry drift.'),
+        DeclareLaunchArgument(
             'ground_height', default_value='0.1',
             description='Grid/MaxGroundHeight, measured in base_frame because '
                         'Grid/MapFrameProjection is false. If base_frame is '
@@ -493,7 +550,32 @@ def generate_launch_description():
                         "read. false forces append even in construct."),
         DeclareLaunchArgument(
             'config_dir', default_value=CONFIG_DIR,
-            description='Directory holding cam0_pinhole.yaml, cam1_pinhole.yaml, '
-                        'stereo_imu.yaml.'),
+            description='VINS config directory the shim reads its calibration '
+                        'from. pinhole: cam{0,1}_pinhole.yaml + stereo_imu.yaml '
+                        '(sim). fisheye: cam{0,1}_fisheye.yaml + stereo_imu.yaml '
+                        '(real rig: vins_fusion_ros2/config/wil).'),
+        DeclareLaunchArgument(
+            'camera_model', default_value='pinhole',
+            description='pinhole = sim bags, raw frames are already rectified. '
+                        'fisheye = real rig; the shim remaps every pair onto a '
+                        'virtual rectified pinhole pair (hfov_deg) because '
+                        'RTAB-Map has no equidistant stereo model.'),
+        DeclareLaunchArgument(
+            'left_cam', default_value='0',
+            description='fisheye only: index of the physically LEFT camera. '
+                        'Validated against the extrinsic at startup (the shim '
+                        'exits if that camera is on the right). Since the '
+                        '2026-10-19 remount cam1 is left on the real rig: left_cam:=1.'),
+        DeclareLaunchArgument(
+            'rect_scale', default_value='1.0',
+            description='fisheye only: rectified output size as a fraction of '
+                        'the 1920x1080 input. 0.5 cuts RTAB-Map dense stereo '
+                        '(SGBM) cost ~4-8x; use it when the back-end cannot keep '
+                        'up. Depth precision per pixel halves with it.'),
+        DeclareLaunchArgument(
+            'hfov_deg', default_value='110',
+            description='fisheye only: horizontal FOV of the virtual pinhole. '
+                        '110 reproduces the sim depth budget (fx*B ~ 60 px*m); '
+                        '130 keeps more of the fisheye at 2/3 the depth precision.'),
         OpaqueFunction(function=launch_setup),
     ])
