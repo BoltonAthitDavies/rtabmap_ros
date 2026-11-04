@@ -1371,9 +1371,13 @@ ros2 launch ./rtabmap_ros/rtab_sim.launch.py mode:=construct rviz:=true \
 # ros2 bag play dataset/dataset_realv5_000 --rate 0.5       (no --clock)
 ```
 
-**Running it without starving ORB (2026-10-29).** ORB + shim + rtabmap do not fit
+**Running it without starving ORB (2026-10-29).** ORB + shim + rtabmap did not fit
 on this laptop together at 1080p (the sim had the same problem with VINS, §6d).
-Two levers, use both:
+**Update 2026-11-04 (user report): live co-running ORB-SLAM3 and RTAB-Map now works.**
+The exact conditions were not recorded here -- presumably the GPU front end
+(patches 10/10b), `rect_scale:=0.5`, `detection_rate:=1.0` and a cool CPU; confirm
+and write them down before quoting a live-mode map. The two-pass route below stays
+valid and remains the deterministic choice for A/Bs. Two levers, use both:
 
 1. **Two passes, replaying ORB's trajectory.** `script/gt_tf_publisher.py` reads the
    11-column `vio.csv` ORB writes (`trajectory_writer.cpp`: t_ns, xyz, qw qx qy qz,
@@ -1537,6 +1541,17 @@ rect_scale 0.5 -- use ~3 m, or rect_scale 1.0 to stretch each bound by ~1.4x. Th
 self-cal's ~1 px vertical bias shows as the worse near-range numbers (4 vs 1 cm);
 the misrectified column is 2-4x worse at 2-4 m, which is the smear.
 
+**`extend` mode first exercised, on a real database (2026-11-04).** `mode:=extend` on
+`map/realv7_001_lc/realv7_001_lc.db` (session 0: 80 nodes, 123 s) with the live
+ORB front end added session 1 (70 nodes, 85 s, a different window of the same
+recording, 254 s earlier) and stitched it: 96 cross-session links (58 global
+closures + 38 local-space), 150 nodes total. Correctness of the closures is
+unscored (no real-site ground truth); the sim rule still applies -- a closure
+correction above ~1 m is suspect. Two traps found on the way: duplicated launch
+arguments (last wins) and a directory `database_path` resolving to a NEW
+`rtabmap.db` -- the launch now picks the single .db in a directory and refuses
+extend/localize on a missing file. `delete_db` is still refused in these modes.
+
 **`imu_link` is NOT a usable base frame.** ORB's `IMU.T_b_c1` = diag(1,-1,-1) makes
 `imu_link` x-right, y-UP, z-BACKWARD, and `Grid/MaxGroundHeight` is measured along
 base_frame z. Publish a FLU `base_link` under it and pass `base_frame:=base_link`:
@@ -1547,7 +1562,15 @@ base_frame z. Publish a FLU `base_link` under it and pass `base_frame:=base_link
 (R = Rz(90)Ry(90): base forward = -z_imu, left = -x_imu, up = +y_imu, verified
 numerically.) Then `ground_height` keeps its sim meaning (~0.1 above the floor).
 
-Not yet done: `ground_height` for the real rig is unknown (the IMU's height above
+**2026-11-04: IMU height measured = 0.11 m** (user's static TF `--y -0.11`), and the
+`imu_link -> base_link` transform is now published BY THE LAUNCH: `frontend:=orb|vins`
+sets odom/body frames (ORB real: orbslam3_world -> imu_link; ORB sim: -> base_footprint;
+VINS: world -> body), `publish_base_tf:=auto` adds the static publisher only for
+`camera_model:=fisheye`, `imu_height:=0.11` default, `base_frame` defaults to base_link
+then. Terminal 2 of the real-rig procedure is gone. Live co-running works since the
+cooling fan is on (thermal was the limit, not the pipeline).
+
+Not yet done (SUPERSEDED above for the height): `ground_height` for the real rig is unknown (the IMU's height above
 the floor has not been measured; the sim's 0.29 is in `base_footprint` terms), the
 real ORB config has `loopClosing: 1` (set 0 for the closure-free map, back to 1
 to load the Atlas), and no RTAB-Map database has been built from real imagery
@@ -1560,7 +1583,93 @@ extrinsics (unchanged).
 
 ## 8. Open items
 
-**Where the two scripts live.** They are currently inside this fork
+**Where the two scripts live -- RESOLVED 2026-11-04.** `rtab_sim.launch.py`,
+`rtab_camera_shim.py`, `rtab_trajectory_writer.py` and `rtab_map.rviz` moved to the
+new `vslam_navigation` package (`launch/rtabmap.launch.py`, `scripts/`, `rviz/`),
+built with `colcon build --symlink-install --packages-select vslam_navigation`.
+`rtabmap_ros/rtab_sim.launch.py` is now a forwarding stub (CLI arguments are
+inherited by the included description), so every command in this record still
+runs. `vslam_navigation/launch/mapping_real.launch.py` is the one-command real-rig
+mapping bring-up: ORB-SLAM3 (wil_stereo_imu) + rtabmap.launch.py with
+frontend:=orb camera_model:=fisheye, `map_name:=` and `calibration:=` (wil |
+wil_311026_selfcal, both read from the SOURCE config trees), RTAB-Map started
+`rtabmap_delay` 5 s after ORB so no pre-odometry frames block wait_for_transform.
+`localize_real.launch.py` (same shape, mode:=localize, read_only default true, loop
+closure forced on, refuses a missing prior) was added the same afternoon.
+**Trap found on the first real runs (4 Nov 14:14-14:21): launch-argument name
+collision.** Launch configurations are inherited by included launches, so a parent
+argument named like a child's (`imu_accel_scale`, declared with default '' and only
+forwarded when non-empty) handed the ORB launch an EMPTY string -> orbslam3_node died
+in < 1 s with "parameter 'imu_accel_scale' has invalid type ... string" on all three
+runs; the user had started ORB by hand without noticing. Renamed to
+`orb_imu_accel_scale`; probe run shows the node loading settings with 0.9923. Rule:
+never give a bring-up launch an argument with the same name as an included launch's
+argument unless it is always forwarded explicitly.
+**Second leak of the same kind (14:37 run, realv7_000 replayed correctly):** an
+include's `launch_arguments` are SET in the shared context and stay there, so the
+rtabmap include in localize_real inherited the ORB include's `output_path`; the
+RTAB-Map trajectory writer then wrote the PRIOR map's graph (98 rows, realv7_001
+stamps) over ORB's vio.csv (1759 poses; `final_frame_trajectory.txt` still has
+them). Fixed by pinning `output_path: ''` in the rtabmap include. Rule: every
+argument an included launch declares must be passed explicitly when two includes
+share a context. `scripts/localization_recorder.py` added (started by
+localize_real): /localization_pose with an inside-extent flag from the prior db's
+node bounds (+margin), the map->odom correction at 2 Hz with its step, and a
+summary line -> `map/<map>/localize_<run>.csv`. Probe without a bag: extent of
+realv7_001_prior x -5.3..0.0, y -9.1..0.8 m; summary "poses 0, first correction
+never" as expected. The 14:37 run itself left no relocalisation evidence.
+**First relocalisation on a real prior map -- 2026-11-04 14:46, realv7_000 on
+`realv7_001_prior` (108 nodes, built from realv7_001; both bags 31 Oct, same mount,
+calibration `wil`).** `map/realv7_001_prior/localize_realv7_000_on_prior.csv`:
+74 localisation poses at 1 Hz from bag +4 s to +91 s with no gap > 3 s, **100 %
+inside the prior's extent**, covariance trace median 0.021. The map->odom correction
+was re-seated twice in the first seconds -- +4.5 s (-3.38, 0.99 m, 87.9 deg) then
++5.5 s (-0.36, -1.88 m, -8.2 deg), a 4.2 m jump of the robot's map pose -- and then
+held for 85 s with step median 0.000 m, p95 0.026 m, max 0.000 m after +5.5 s. The
+two early steps coincide with ORB's IMU initialisation (imu_initialization_time
+2.5 s) and its post-init frame re-alignment, not with a later aliasing event; ORB
+had 0 resets and 3 losses totalling 0.1 s. The robot's map trajectory (x -5.6..0.0,
+y -6.9..1.0) lies inside the prior's node extent (x -5.3..0.0, y -9.1..0.8). No
+ground truth, so "correct" rests on consistency: an 85 s run with centimetre
+corrections and every pose inside the map. Rule for judging such runs: ignore
+corrections during the front end's init transient (first ~6 s), then apply the
+> 1 m step rule. Run was fully from `localize_real.launch.py` (no separate ORB
+terminal, 6 processes clean).
+**Nav2 layer built and tested offline (2026-11-04 afternoon; robot broken, so no
+drive test).** `vslam_navigation` now has `params/nav2_real.yaml` (from the sim's
+nav2_ackermann.yaml: odom frame orbslam3_world, rolling local costmap in that frame,
+/map from RTAB-Map use_saved_map, no live obstacle layer, speed cap 0.6 m/s,
+use_sim_time rewritten at launch), `behavior_trees/` (sim BT copied),
+`scripts/pose_gate.py` (init transient >= 8 s, correction step < 1 m for 6 samples,
+robot inside the prior's extent + 2 m -> /localization_ok, relays
+/localization_pose_gated, STARTUP/PAUSE/RESUME of the Nav2 lifecycle manager),
+`scripts/ackermann_bridge.py` (/cmd_vel -> /cmd_velocity + /cmd_steering, bicycle
+model, zero on stale cmd or gate false, dry_run default TRUE; wheel_base 0.42,
+steering limit 0.6109, topic units all UNVERIFIED on the real chassis),
+`launch/nav2_real.launch.py` (also the offline harness: map_yaml:= starts a
+map_server), `launch/navigate_real.launch.py` (localize_real + nav2_real + RViz
+`rviz/navigation.rviz`). Offline harness run on `realv7_001_prior` exported to
+pgm, static TFs for map->orbslam3_world (identity) and ->base_link at node 15, goal
+at node 75 (5.05 m away): gate went OK after the 8 s window, STARTUP -> "Managed
+nodes are active", goal accepted, 62 plans of 69 poses, 1369 /cmd_vel at v median
+0.46 m/s (regulated below the 0.6 cap), max curvature |w/v| 1.08 1/m under the
+1.67 rear-axle bound; bridge dry-run showed steering held at 0.425 rad while the
+smoother ramped velocity (scale_velocities working); "Failed to make progress" and
+"spin failed" are the expected consequences of a robot that cannot move / cannot
+rotate in place. Untested: the whole chain live (navigate_real on a bag replay
+with ORB + RTAB-Map localize), and everything on the robot.
+`navigate_real.launch.py` run on realv7_000 against `realv7_001_prior` (15:31-15:35,
+15 processes, all clean, bridge dry-run): localisation again 73 poses, 100 % inside
+the extent, one early re-seat (3.83 m) then stable -- the third consistent
+relocalisation of this pair. Whether the gate opened and a goal was planned was not
+captured (nav2/gate output goes to the screen only), so the gate now also writes
+`map/<map>/gate_<run>.csv` (transitions + lifecycle commands).
+Next steps in that package: re-run navigate_real once so the gate log exists;
+measure wheel_base, steering limit, footprint and the /cmd_* units on the robot;
+Nav2 (from the sim's nav2_ackermann.yaml), RViz config. Paths quoted below this
+line are historical.
+
+**Where the two scripts live (original note).** They are currently inside this fork
 (`rtabmap_ros/rtab_camera_shim.py`, `rtabmap_ros/rtab_sim.launch.py`). That is
 almost certainly wrong: they are WiL project code, not upstream RTAB-Map code,
 and will collide or be lost on any upstream merge. The workspace convention puts
