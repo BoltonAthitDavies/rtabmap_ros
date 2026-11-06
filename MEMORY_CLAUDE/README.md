@@ -1664,6 +1664,25 @@ the extent, one early re-seat (3.83 m) then stable -- the third consistent
 relocalisation of this pair. Whether the gate opened and a goal was planned was not
 captured (nav2/gate output goes to the screen only), so the gate now also writes
 `map/<map>/gate_<run>.csv` (transitions + lifecycle commands).
+**Real chassis parameters (user, 6 Nov 2026) and the command interface measured
+from dataset_realv7_001:** wheel_base 0.46 m, steering limit +-20 deg, footprint
++0.13/-0.52 m along x, +-0.21 m along y about base_link, target 1.5 m/s.
+Derived: rear-axle curvature 0.791 1/m (R 1.264 m), base_link R 1.345 m ->
+`minimum_turning_radius` 1.45, RPP `min_lookahead_dist` 2.70 (>= 2 x 1.345),
+max yaw rate 1.2 rad/s; chosen accelerations 0.5 / -1.0 m/s^2 (3 s to 1.5 m/s,
+1.1 m stop). `/cmd_steering` is DEGREES and POSITIVE = RIGHT: 10/10 windows of
++-30 deg commands gave the opposite-signed body turn rate (0.19-0.26 rad/s at
+0.29 m/s, R ~1.4 m at the IMU, i.e. the +-30 commands saturate at ~18-20 deg) ->
+bridge steering_scale 57.3, steering_sign -1. `/cmd_velocity` 1.25 held 112 s
+gave 0.29 m/s median (p90 0.37) -> velocity_scale 4.3 PROVISIONAL (one operating
+point; realv2's /feedback/velocity read 3.0 x tracker speed, so the unit is
+unknown and the response may be nonlinear); bridge caps the published command at
+`max_command_velocity` 2.5 units until two more points are measured. Offline
+harness rerun with these values: gate -> Nav2 active, goal accepted, 59 plans of
+130 poses (longer: the 1.45 m radius), cmd_vel 1.38 m/s, max curvature 0.68 < 0.79,
+bridge dry-run steering -17.3 deg. Also fixed: an EMPTY `-p log_file:=` kills a
+rclpy node at init ("Couldn't parse parameter override rule") -- pass optional
+parameters only when set.
 Next steps in that package: re-run navigate_real once so the gate log exists;
 measure wheel_base, steering limit, footprint and the /cmd_* units on the robot;
 Nav2 (from the sim's nav2_ackermann.yaml), RViz config. Paths quoted below this
@@ -1707,3 +1726,43 @@ the odometry — not to revert to the topic naively.
 **Disk.** The workspace sat at 98–99 % full during this work (849 MB free at one
 point); the build needs ~450 MB and an RTAB-Map database ran to 15 MB for 40 s.
 Currently 8.9 GB free.
+
+## Live operation from the laptop: abandoned (6 Nov 2026)
+
+First attempt at `localize_real.launch.py` against the live robot instead of a bag.
+The image topics appeared unreadable. Two separate causes, one of them mine.
+
+**Measurement artefact.** `timeout N ros2 topic hz /t | tail` prints nothing even for a
+200 Hz topic: Python block-buffers stdout into a pipe and SIGTERM kills it before the
+flush. Every rate probe looked like silence while `ros2 topic echo --once` on the same
+topics returned immediately. Correct form:
+
+    export PYTHONUNBUFFERED=1
+    timeout -s INT 20 ros2 topic hz /t --window 50 > out.txt 2>&1
+
+**Real cause.** Compressed frames are 0.52 MB each at 1920x1080 and the publishers are
+RELIABLE.
+
+| subscribers | rate | throughput |
+|---|---|---|
+| cam0 alone | 25.9 Hz | 13.26 MB/s |
+| cam0 + cam1 | 0 / 5-7 Hz | 0.19 / 0.22 MB/s |
+
+Both streams together deliver ~0.41 MB/s, a 32x collapse rather than a split. Each
+sample fragments into hundreds of datagrams; one lost fragment retransmits the whole
+sample, so beyond capacity nothing completes. No stereo pair ever arrives, so the
+`message_filters` synchroniser in both the ORB node and `rtab_camera_shim.py` never
+fires. Buffer and QoS tuning on the subscriber side cannot change this arithmetic.
+
+Decision: clone the repo onto the Jetson and run the stack there. Bag replay on the
+laptop is unaffected. All five launch/script files resolve `~/wil_project`, so a clone
+at the same path needs no edits.
+
+**Still open for live running, wherever it runs.** `rtabmap.launch.py` hard-codes
+`use_sim_time: true` in four places while `wil_stereo_imu.launch.py` sets it false in
+two. On bags that was correct. Live, the robot publishes `/clock` at 62-75 Hz from
+`robot_can_interface`, measured 153 s behind the laptop wall clock, so the laptop
+mixed two timelines and every TF lookup would have failed. On the Jetson both clocks
+have the same origin and the mismatch is harmless, but `/clock` stalling would freeze
+the RTAB-Map side while ORB keeps running. A single `use_sim_time` argument threaded
+from `localize_real.launch.py` into both includes is the fix; not yet written.
