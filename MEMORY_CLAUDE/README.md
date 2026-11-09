@@ -1766,3 +1766,272 @@ mixed two timelines and every TF lookup would have failed. On the Jetson both cl
 have the same origin and the mismatch is harmless, but `/clock` stalling would freeze
 the RTAB-Map side while ORB keeps running. A single `use_sim_time` argument threaded
 from `localize_real.launch.py` into both includes is the fix; not yet written.
+
+## mapping_sim.launch.py: the simulation wrapper (6 Nov 2026)
+
+`mapping_real.launch.py` starts ORB-SLAM3 itself, so the rig needs two terminals
+(launch + bag). Simulation needed three until now. `mapping_sim.launch.py` closes
+the gap:
+
+    ros2 launch vslam_navigation mapping_sim.launch.py \
+        map_name:=dataset_allsensor_realistic_01_map loop_closure:=false
+    ros2 bag play "/media/.../dataset_allsensor_realistic_01_map" --rate 0.3
+
+**Why mapping_real cannot be reused for simulation.** Tried first, and it produces a
+zero-node database rather than an error:
+
+  * `config_file` is NOT one of its seventeen arguments. It exists inside the file
+    only as the value derived from `calibration` and handed to the ORB launch, and
+    ros2 launch drops undeclared arguments silently (the `accel_scale` lesson). A
+    command-line `config_file:=.../wil_sim/stereo_imu.yaml` is therefore ignored and
+    ORB loads the real fisheye calibration.
+  * it hard-codes `camera_model: 'fisheye'` with no override, so the shim would run
+    Kannala-Brandt rectification on frames that are already ideal pinhole, using
+    rig intrinsics.
+  * fisheye + frontend orb selects `imu_link` as the body frame and publishes
+    `imu_link -> base_link`; in simulation ORB broadcasts to `base_footprint`.
+  * `wil_stereo_imu.launch.py` sets use_sim_time false (the real bags carry no
+    /clock); the simulation bags carry 315 203 clock messages and the simulation ORB
+    launch sets it true.
+
+Confirmed empirically: `map/dataset_allsensor_realistic_01_map.db` written by the
+mapping_real attempt at 18:25 held 0 nodes, 0 links, 0 words (106 496 bytes, the
+empty-database size).
+
+**What the wrapper pins.** camera_model pinhole; front end
+`orbslam3_ros2 wil_sim_stereo_imu.launch.py` (defaults to config/wil_sim, sim time
+on); `image_transport:=compressed` because the simulation bags are compressed-only;
+no imu_height, since publish_base_tf 'auto' acts only on the fisheye path;
+`orb_output_path` renamed away from the child's `output_path` for the usual
+inheritance reason. It refuses a fisheye calibration directory (checks for
+cam0_pinhole.yaml) and refuses `mode:=extend` with no existing database.
+
+Verified 6 Nov on dataset_allsensor_realistic_01_map: 19 nodes in 60 s of replay,
+closure-free, occupancy cells on all 19, extent 11.0 x 27.5 m over 36.2 m of path.
+
+**Shim shutdown fix found by that run.** A SIGINT invalidates the rclpy context while
+message_filters is mid-callback, so `pub_left.publish()` raises RCLError, which is
+neither KeyboardInterrupt nor ExternalShutdownException and escapes `rclpy.spin()`.
+Every clean Ctrl-C was reported as `process has died [... exit code 1 ...]` with a
+twenty-line traceback -- pre-existing, and it affects mapping_real identically.
+`rtab_camera_shim.py` now returns early from `on_pair` when `rclpy.ok()` is false and
+swallows the lost-race exception in `main` only once shutdown has begun, so a real
+mid-run fault stays loud. All four processes now report "finished cleanly".
+RCLError is not importable from `rclpy.exceptions` in Humble, hence the context guard
+rather than an except clause on the private pybind symbol.
+
+**Replay rate.** At `--rate 0.5` ORB reported "dropped 3 of 525 stereo frames";
+its own warning says any drop makes two runs incomparable. Use 0.3 or lower for a
+map that will be scored.
+
+## Simulation parity: localize_sim / nav2_sim / navigate_sim (6 Nov 2026)
+
+The rig had mapping, localize, nav2 and navigate; simulation had only mapping (and
+that only since earlier today). The gap is now closed, in `vslam_navigation`:
+
+| rig | simulation |
+|---|---|
+| mapping_real.launch.py | mapping_sim.launch.py |
+| localize_real.launch.py | localize_sim.launch.py |
+| nav2_real.launch.py | nav2_sim.launch.py |
+| navigate_real.launch.py | navigate_sim.launch.py |
+| params/nav2_real.yaml | params/nav2_sim.yaml |
+
+    ros2 launch vslam_navigation navigate_sim.launch.py map_name:=<prior> \
+        world:=.../small_warehouse_static_realistic_nofloortexture_01.world
+
+**What already existed and is REUSED, not rewritten.**
+`aws_robomaker_small_warehouse_world localization_rtabmap.launch.py` already builds
+the whole SLAM frame tree (map -> odom -> vio_body -> base_footprint -> base_link,
+one publisher per edge, front ends told to publish odom -> vio_body directly) and
+already pins `output_path: ''` and `rviz: false` for its caller. `localize_sim`
+includes it and adds only what it lacks: a `map_name` interface so the database and
+the CSV land together under map/<name>/, and `localization_recorder.py`.
+
+**Why the warehouse package's nav2.launch.py is not the answer.** It includes
+`localization_tf.launch.py`, so it navigates on GROUND TRUTH, whose map -> odom is
+an exact static identity. That is the right tool for testing Nav2 itself and cannot
+answer whether the robot can navigate on a map it built and relocalised into. The
+two are mutually exclusive, not composable: both publish map -> odom.
+
+**What nav2_sim.yaml changes from nav2_ackermann.yaml, and nothing else.** The
+chassis half (wheel_base 0.42, 35 deg, minimum_turning_radius 0.75, lookahead
+1.30/2.00, footprint, smoother limits) is untouched -- the chassis did not change.
+Changed, all because localisation changed:
+  * local costmap is ROLLING 10x10 m. The source file states its non-rolling
+    costmap in the odom frame is safe "only because map->odom is a permanent, exact
+    identity". Under SLAM localisation that premise is false.
+  * odom_topic /orbslam3/odometry, not /odom: nothing publishes /odom here, because
+    ground_truth_localization is what we replaced.
+  * autostart false, so pose_gate.py starts the stack when localisation is sound.
+  * allow_unknown stays false but now BITES: a stereo-built prior has unknown space
+    where the baked map had none, so some goals are refused for that reason.
+  * cache_obstacle_heuristic false: the static layer is republished when RTAB-Map
+    updates the grid.
+  * use_collision_detection FALSE. The source file's own sweep records ON at
+    lookahead 1.30 giving "paralysis, 155 vetoes, 0.10 m/s", and a stereo prior is
+    less trustworthy than a baked one. Note nav2_ackermann.yaml's comment says OFF
+    while its value says true; the two disagree there.
+
+**No ackermann_bridge in simulation, and that is structural.** gz AckermannSteering
+takes a Twist on /model/<robot>/cmd_vel and small_warehouse's cmd_vel_bridge already
+forwards /cmd_vel. The chain stops at /cmd_vel. The rig needs /cmd_velocity and
+/cmd_steering in its own units instead. pose_gate.py and localization_recorder.py
+needed NO changes: both already parameterise map/odom/base frames, so simulation
+just passes odom_frame:=odom.
+
+**Verified, not merely written.** Offline harness (static TF stand-ins, map_server
+on maps/baked_dynamic_realistic_01, no Gazebo, no estimator), start (-6.4, 10.95)
+to goal (7.4, -9.85), a pair chosen because the straight line between them crosses
+84 blocked cells:
+
+    all 7 lifecycle nodes      active
+    plans                      51, first 237 poses / 28.53 m in frame map
+    cmd_vel                    1029 msgs, linear.x max 1.500 m/s, |w| max 0.565
+    curvature max              0.377 1/m against the rear-axle bound 1.6673 -> feasible
+
+A bare `nav2_sim.launch.py` with no TF and no map stalls at "Configuring
+controller_server" with `Invalid frame ID "odom"` repeating from local_costmap: that
+is the costmap waiting for odom -> base_link, not a parameter fault. Every plugin
+configures, Smac included.
+
+**World must match the prior.** `world` defaults EMPTY so small_warehouse's own
+default is used and cannot drift from it; the realistic worlds are
+small_warehouse_static_realistic_nofloortexture.world (layout U) and
+..._nofloortexture_01.world (layout I), and the realistic_01 bags are layout I.
+An earlier draft defaulted it to a no_roof_small_warehouse.sdf path that does not
+exist (the file is .world).
+
+## Three bugs from the first real navigate_sim run (6 Nov 2026)
+
+The user ran navigate_sim twice: once alongside a separate small_warehouse terminal,
+then once on its own. Both aborted. Three distinct faults, two of them mine.
+
+**1. Reading the log. Only the FIRST error matters.** Both logs ended in a wall of
+
+    terminate called after throwing an instance of 'rclcpp::exceptions::RCLError'
+      what(): could not create service: rcl node's context is invalid
+    process has died [... exit code -6 ...]
+
+from robot_state_publisher, joint_state_publisher and the vio_body static TF, plus
+`ign gazebo ... failed to terminate 5 seconds after SIGINT`. None of those are
+faults. navigate_sim starts the localisation layer on a TimerAction at +12 s, so
+when the launch aborts at t<12 s the shutdown lands exactly while those nodes are
+constructing, and they abort with an invalid context. The real error is at the TOP.
+
+**2. frontend spelling, localize_sim's bug.** `vslam_navigation` spells ORB-SLAM3
+`orb` everywhere; `localization_rtabmap.launch.py` validates `vins|orbslam3`.
+localize_sim passed `orb` through, giving
+
+    frontend must be vins|orbslam3, got 'orb'
+
+Fixed by translating at the boundary (ALIAS dict), not by changing the package's
+own spelling.
+
+**3. frontend LEAK, a latent bug in localization_rtabmap.launch.py.** With that
+fixed the error inverted:
+
+    frontend must be orb|vins (or empty), got 'orbslam3'
+
+because launch configurations are inherited by included launches and that file
+never pinned `frontend` for its rtab include, although it sets odom_frame,
+body_frame and base_frame explicitly -- and rtabmap.launch.py's contract is
+"explicit odom_frame/body_frame win when frontend is empty". Its default `vins`
+hid this, being a value the child also accepts, so only the ORB path ever broke.
+Fixed by adding `'frontend': ''` to that dict.
+
+## Closure-free priors could never be relocalised against (fixed 6 Nov 2026)
+
+The run that exposed this logged, in localize mode:
+
+    Update RTAB-Map parameter "Rtabmap/LoopThr"="1.0" from database
+    Update RTAB-Map parameter "RGBD/ProximityBySpace"="false" from database
+
+RTAB-Map restores its parameter set FROM THE DATABASE. A prior built with
+`loop_closure:=false` therefore comes back with closures disabled even when the
+launch is asked for them, and `_loop_closure_params(enabled=True)` returned `{}`,
+setting nothing to stop it. In mode:=localize that is fatal and silent, because
+relocalising against a prior IS accepting a loop closure against it: the node
+starts, publishes /localization_pose, and never localises.
+
+This is the explanation for the real-rig result scored earlier the same day:
+
+| prior | closures in db | localisation cov_trace |
+|---|---|---|
+| map_prior_v2 | 0 | 3e+04 on all 76 poses (no-information value) |
+| realv7_001_prior | 32 | median 0.022 |
+
+map_prior_v2 was not a bad relocalisation, it was no relocalisation at all. Its
+correction yaw drifting 0 -> 112 deg and the single 1.20 m step were the pose being
+dragged by odometry, not a closure being accepted.
+
+`_loop_closure_params(True)` now returns RTAB-Map's own defaults explicitly,
+`Rtabmap/LoopThr 0.11` and `RGBD/ProximityBySpace true`, and rosparam wins over the
+stored value. Verified: the log now says "Setting ... (rosparam)" for both instead
+of "Update ... from database".
+
+CONSEQUENCE FOR SCORING: every localisation run made against a closure-free prior
+before this date is void, on both the rig and in simulation. Re-run them. The
+diagnostic is cheap -- cov_trace 3e+04 in the recorder CSV means nothing localised.
+
+## Real chassis: wheel base corrected to 0.60 m (user, 7 Nov 2026)
+
+The rig's wheel base is 0.60 m, not the 0.46 m recorded on 6 Nov. What changed
+and what did not:
+
+**Unchanged.** Experiment 1's real-robot baseline. `script/real_wheel_baseline.py`
+records the wheelbase but does not use it -- the rig publishes no steering
+measurement, only a two-valued command echo, so no bicycle model is formed. The
+0.22-0.46 m dead-reckoning results stand.
+
+**Changed.** Everything derived from the Ackermann geometry in
+`vslam_navigation`, recomputed at the 20 deg steering limit:
+
+| quantity | L = 0.46 | L = 0.60 |
+|---|---|---|
+| rear-axle curvature tan(d)/L | 0.791 1/m | 0.607 1/m |
+| R_rear | 1.264 m | 1.649 m |
+| base_link radius sqrt(R_rear^2 + L^2) | 1.345 m | 1.754 m |
+| minimum_turning_radius | 1.45 | 1.85 |
+| lookahead min / dist / max | 2.70 / 2.70 / 3.50 | 3.55 / 3.55 / 4.50 |
+| regulated_linear_scaling_min_radius | 1.60 | 2.00 |
+| max yaw at 1.5 m/s | 1.19 rad/s | 0.91 rad/s |
+| smoother max_velocity yaw | 1.20 | 0.91 |
+| behaviour max_rotational_vel | 1.2 | 0.91 |
+| turning circle | 2.7 m | 3.5 m |
+
+Also updated: `ackermann_bridge.py` default (the wheelbase is LIVE there, in
+`steer = atan(L*w/v)`), the `wheel_base` launch defaults in `nav2_real` and
+`navigate_real`, and the report (chapter 3 twice, chapter 4 via the Experiment 1
+note plus `build_chapter4.py`, chapter 5).
+
+A 3.5 m turning circle in a 10 x 7 m zone is half the short dimension. Expect
+Smac to reject more goals than the earlier 2.7 m figure implied; that is correct
+behaviour, not a regression.
+
+**UNRESOLVED: the steering limit, not the wheelbase.** The realv7_001 cross-check
+(ORB trajectory against /cmd_steering +-30) measured a turn rate of 0.19-0.26
+rad/s at 0.29 m/s, i.e. R ~1.4 m at the IMU. At L = 0.46 that implied an 18 deg
+wheel angle, consistent with the stated +-20 deg; at L = 0.60 the same
+measurement implies 23 deg, ABOVE the limit. Either the limit is nearer 23 deg,
+or the radius was optimistic (R = 1.6 m gives 20.6 deg). The configs keep 20 deg
+deliberately: it plans a wider circle than the car may need, and planning wider
+than the car can turn is the safe error. Re-measure on a figure-of-eight at full
+lock before raising it.
+
+## Chapter 3 now describes this package (7 Nov 2026)
+
+`docs/report/final_report/chapters/chapter_3_methodology.tex` gained
+section 3.3's last subsection, `sec:nav-integration`, written in-chapter (not a
+fragment): pose by transform rather than by topic, the stereo shim's two domain
+cases, the three memory modes with the closure-free-prior reasoning and the
+LoopThr-from-database defect, the pose gate's three conditions, the command
+interface with the bicycle inversion, a task/entry-point table
+(`tab:nav-integration`) and a status paragraph. The framing is that the package
+is the INSTRUMENT answering the second half of Experiment 4's question ("is the
+map usable by a route planner"), while path planning stays outside the evaluated
+scope -- no navigation result is reported. A `Navigation integration / added` row
+was added to `tab:deviations`, objective 5's status now notes the bring-up
+exists, and the coordinate-frame subsection gained the label
+`sec:frames-contract` so it can be cross-referenced. Report compiles, 133 pages,
+no undefined references.
