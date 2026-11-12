@@ -2035,3 +2035,423 @@ was added to `tab:deviations`, objective 5's status now notes the bring-up
 exists, and the coordinate-frame subsection gained the label
 `sec:frames-contract` so it can be cross-referenced. Report compiles, 133 pages,
 no undefined references.
+
+## Relocalisation is seeded at the spawn point (user constraint, 11 Nov 2026)
+
+The robot is returned to its spawn point before every relocalisation run, so the
+run no longer has to find itself from nothing. `start_pose` on
+`rtabmap.launch.py`, threaded through `localize_{sim,real}` and
+`navigate_{sim,real}`, default `origin`:
+
+| value | effect |
+|---|---|
+| `origin` (default) | `RGBD/StartAtOrigin=true` |
+| `last` | previous behaviour, `StartAtOrigin=false` |
+| `"x y z roll pitch yaw"` | the node's `initial_pose` parameter |
+
+Guarded: a non-`origin` value outside `mode:=localize` is refused rather than
+silently ignored, since RTAB-Map applies both mechanisms in localisation mode
+only; so are a wrong arity and non-numeric values. All three forms verified
+against the node's own log (`StartAtOrigin` true/false, and `Setting initial
+pose: xyz=... rpy=...`).
+
+**The seed is the map's FIRST NODE, not the map frame's identity.** RTAB-Map says
+so: "last localization pose is ignored (RGBD/StartAtOrigin=true), assuming we
+start at the first node of the map." Measured against the exported ground truth:
+
+| prior | spawn pose (GT) | node 1 at | robot moved by then |
+|---|---|---|---|
+| `dataset_allsensor_realistic_map` (U) | x 5.25, y 20.00, yaw -90 deg | +0.80 s | 0.000 m |
+| `dataset_allsensor_realistic_01_map` (I) | same | +1.24 s | 0.051 m |
+
+So the seed is the spawn pose to within 5 cm. Node 1 sits 0.26 m from the map
+frame's identity, that being where the front end initialised, and
+`StartAtOrigin` does not use it -- an earlier draft of this note had the 0.26 m
+as the seed error, which was wrong.
+
+**What this fixes, and it was not obvious.** We set `Mem/LocalizationReadOnly` in
+localize mode. RTAB-Map's own parameter documentation states that the last
+localisation pose is then never written back, so the run "will always restart to
+original last localization pose ... unless RGBD/StartAtOrigin is used". That
+stored pose is wherever the 300 s MAPPING run finished -- metres away, in a
+different aisle. Every relocalisation run made before this change was seeded
+there and recovered by appearance alone, and that recovery was being measured as
+if it were relocalisation performance. The launch comment that previously
+justified `StartAtOrigin=false` ("the origin is wherever the mapping run's
+front-end initialised, which is not where this run starts") was reasoning about
+the map frame identity and did not account for the seed being node 1.
+
+**Consequence for the report.** This narrows the claim: known-start
+relocalisation, not the arbitrary-start capability the proposal listed, which
+`tab:deviations` already labels `planned`. Chapter 3's section 3.3.6 describes
+the three memory modes but says nothing about seeding, so it is incomplete
+rather than wrong; add the constraint there, and say "known-start" wherever a
+relocalisation result is quoted. `start_pose:=last` is how to measure
+arbitrary-start deliberately.
+
+## The spawn pose must match the prior, and one world no longer does (11 Nov 2026)
+
+`start_pose:=origin` asserts that the robot begins where the prior's first node
+is. Nothing downstream verified that, and it is currently false for one world.
+
+`worlds/small_warehouse/small_warehouse_static_realistic_nofloortexture.world`
+(the U static twin) has had the robot's spawn pose edited, with the original kept
+as an XML comment immediately above it:
+
+    <!-- <pose>5.25 20 0 0 0 -1.5708</pose> -->
+    <pose>13.0 14.00 0 0 0 -1.5708</pose>
+
+The commented pose is where both mapping recordings begin. The other three
+realistic worlds still spawn at 5.25, 20. So navigating the U prior in that world
+seeds relocalisation 9.80 m away, in a different aisle.
+
+**The map frame, fitted from the prior itself.** A planar rigid fit of the 148
+node poses against the exported ground truth gives world -> map as yaw
++179.93 deg, translation (+5.179, +19.859), residual rms 0.337 m over a 365 m
+route (the ~180 deg agrees with the map-overlay fits in the Experiment 4 work).
+Under that transform:
+
+| world pose | map pose |
+|---|---|
+| 5.25, 20.00, -90 deg (prior spawn) | -0.096, -0.135, +89.93 deg |
+| 13.00, 14.00, -90 deg (world now) | -7.839, +5.875, +89.93 deg |
+
+So either restore the world's spawn to `5.25 20 0 0 0 -1.5708`, or keep the new
+spawn and pass
+
+    start_pose:="-7.839 5.875 0 0 0 1.5695"
+
+which RTAB-Map confirms with "Setting initial pose: xyz=-7.839,5.875,0
+rpy=0,-0,1.5695". The seed then carries the fit's ~0.34 m uncertainty, which is
+immaterial next to 9.80 m.
+
+Both world generators copy the robot include verbatim --
+`make_realistic_world.py` takes `src[src.index('    <!-- ackermann_robot -->'):]`
+as its tail and `make_static_world.py` skips the robot when tagging statics -- so
+a hand-edited spawn pose survives regeneration, but it is inherited from whatever
+file is used as the source.
+
+**What the launches now print.** `navigate_sim` reads the ACTIVE spawn pose out of
+the world file (skipping the commented-out one) and prints it beside the seeding
+assumption; `navigate_real` states the assumption, having no world to read. The
+pose gate did already protect against a bad seed -- the correction when the
+relocaliser recovers far exceeds `max_step`, so Nav2 simply never activates --
+but that symptom looks nothing like a wrong spawn pose. `navigate_real` also
+gained the missing prior-exists guard that `navigate_sim` already had.
+
+## Run CSVs are no longer overwritten silently (11 Nov 2026)
+
+Three 25 s configuration tests, run with `navigate_sim`'s default
+`run_name`, overwrote a recorded run's `localize_<run>.csv` and `gate_<run>.csv`
+in `map/dataset_allsensor_realistic_map/`. `map/` is gitignored, so they were not
+recoverable; the overwritten run was an aborted 6 Nov attempt, so little was
+lost, but the mechanism would have destroyed a good run just as easily.
+`localize_sim` and `localize_real` now refuse to start when the target CSV exists
+and is non-empty, naming both ways out (`run_name:=<other>` or
+`overwrite:=true`), and `navigate_{sim,real}` forward the flag. Verified both
+branches. The gate log is still replaced, being a diagnostic rather than
+evidence.
+
+## Navigation topic interface, and a missing odom_topic (11 Nov 2026)
+
+Enumerated by running `nav2_sim.launch.py` alone -- static transforms and a
+served baked grid standing in for the whole SLAM chain -- then reading
+`ros2 node info` for each node. 33 topics, 4 of them infrastructure.
+
+**Required from outside the navigation layer** (what the SLAM side must provide):
+
+| topic | type | consumer |
+|---|---|---|
+| `/localization_pose` | PoseWithCovarianceStamped | pose_gate |
+| `/orbslam3/odometry` | Odometry | bt_navigator, controller_server, velocity_smoother |
+| `/map` | OccupancyGrid | both costmaps' static layer (map_server here) |
+| `/goal_pose` | PoseStamped | bt_navigator (the operator, from RViz) |
+| `/speed_limit` | nav2_msgs/SpeedLimit | controller_server; optional, nothing publishes it |
+
+**Produced by the navigation layer:** `/cmd_vel` (velocity_smoother and
+behavior_server), `/cmd_vel_nav` (controller -> smoother), `/plan`,
+`/unsmoothed_plan`, `/plan_smoothed`, `/received_global_plan`,
+`/lookahead_point`, `/lookahead_collision_arc`, `/localization_ok`,
+`/localization_status`, `/localization_pose_gated`, the two costmaps'
+`costmap_raw` and `published_footprint`, `/bond`, and one
+`<node>/transition_event` per lifecycle node. On the rig `ackermann_bridge.py`
+then turns `/cmd_vel` into `/cmd_velocity` and `/cmd_steering`; in simulation the
+gz bridge forwards `/cmd_vel` unchanged.
+
+**The defect the enumeration found.** `controller_server` was subscribing `/odom`
+with no publisher. Nav2's own stock parameter file does not list `odom_topic`
+under `controller_server`, so it silently kept its `/odom` default while we set
+the topic only under `bt_navigator` and `velocity_smoother` -- and nothing
+publishes `/odom` here, since `ground_truth_localization` is precisely what the
+SLAM chain replaces. The controller's velocity feedback therefore never arrived.
+It IS settable there: adding `odom_topic: /orbslam3/odometry` under
+`controller_server` moved the subscription, verified by re-running the stack.
+Fixed in BOTH `nav2_sim.yaml` and `nav2_real.yaml`, so the real rig had the same
+gap.
+
+Note `velocity_smoother` subscribes no odometry at all, which is correct: its
+`feedback` is `OPEN_LOOP`, so its `odom_topic` is inert. And the two
+`<costmap>/costmap_raw` topics look publisher-less in a node-by-node sweep only
+because the costmaps are child nodes (`/global_costmap/global_costmap`) that a
+sweep of the seven server names does not visit.
+
+## First full simulation navigation run (11 Nov 2026, 15:41)
+
+`navigate_sim` on `dataset_allsensor_realistic_map` in the U static world, with
+the spawn pose moved to world 13.0, 14.0 and the seed given explicitly as
+`start_pose:="-7.839 5.875 0 0 0 1.5695"`. The whole chain came up and Nav2
+activated. Evidence:
+`map/dataset_allsensor_realistic_map/localize_dataset_allsensor_realistic_map_navigate.csv`
+and `gate_...csv`.
+
+| quantity | value |
+|---|---|
+| localisation poses | 233 over 450 s (t 14.4 to 464.3) |
+| cov_trace at the 3e4 no-information value | 1 of 233 (the seed itself, t=14.356) |
+| cov_trace below 1 | 232 of 233; median 0.028, min 0.00032 |
+| inside the prior's extent | 96 % |
+| map->odom correction steps above 1 m | 2 of 905, max 10.09 m |
+
+The seeded pose is logged first at exactly (-7.839, +5.875) with cov 3e4, and the
+first observed fix 4.8 s later at (-7.632, +6.007) with cov 0.041 -- 0.24 m from
+the seed. So the explicit seed was right and the relocaliser confirmed it rather
+than having to search.
+
+**The 10.09 m first correction is expected, not a fault.** Odometry starts at the
+front end's identity while the seed sits ~9.8 m away in the map frame, so
+map->odom has to take up that offset the moment the first fix lands. The gate's
+8 s init window absorbs it; without that window a 1 m `max_step` would reject
+every seeded start.
+
+**Gate trace, behaving as designed:**
+
+    11.5  no map->odom correction yet
+    14.0-21.5  init transient (8 s)
+    22.0-23.0  correction not stable (3/6, 4/6, 5/6)
+    23.5  localised and stable -> STARTUP
+    26.9  STARTUP done -> active
+    307.0 robot off the map at (20.3, 15.9) -> PAUSE -> paused at 307.6
+
+The pause is correct. The prior's node bounding box in the map frame is
+x -13.38..+18.22, y +0.24..+37.67, and (20.3, 15.9) is 2.08 m outside it against
+the gate's 2.0 m `extent_margin`: the robot drove just past the mapped edge.
+Raise `extent_margin` to allow more, or keep goals inside the box. Note the
+prior's own spawn pose (-0.10, -0.14) is itself 0.38 m outside that box, the box
+being axis-aligned over node positions only.
+
+## The overwrite guard fired too late, and why it is not a file-exists check
+
+The guard added earlier the same day refused the 15:50 retry *after* Gazebo had
+booted, because it lived in `localize_sim`, which `navigate_sim` only reaches on a
+TimerAction 12 s in. The whole simulator start-up was wasted and the launch then
+tore itself down. Fixed: the check is now a shared sibling module,
+`launch/_run_guard.py`, called at the top of `navigate_{sim,real}._setup` before
+any action is built, and from `localize_{sim,real}` where the path is decided.
+Verified -- the refusal now reports zero `ign gazebo` and zero bridge processes
+started.
+
+It also counts rather than tests existence. A run that aborts during start-up
+leaves a header and two summary lines and no data; refusing to replace that would
+block the obvious retry. A file counts as recorded when it holds at least one
+`pose` row, and the message quotes the count ("already holds a recorded run: 233
+localisation poses"). That is what correctly protected the 15:41 run above.
+
+## A prior can have no vocabulary, and that is silent (11 Nov 2026)
+
+The 09:26 `navigate_real` run on `dataset_realv7_map` localised NOTHING: 46
+poses, every one at covariance trace 3e+04, and a single 3.66 m map->odom step
+that was not a verified fix. The cause is in the database, not the run.
+
+Relocalisation matches against the **Word** table (word descriptors). The
+Feature table separately stores each keypoint's assigned `word_id`. A prior can
+have the second and not the first:
+
+| prior | built | closures | Word rows | distinct word ids in Feature |
+|---|---|---|---|---|
+| `dataset_realv7_map` | 11 Nov 02:23 | 1 | 122 | 35,683 |
+| `dataset_realv8_map` | 11 Nov 02:19 | 5 | 393 | 21,965 |
+| `dataset_realv8_000` | 10 Nov 04:40 | 0 | 0 | 5,861 |
+| `dataset_realv8_map_lc` | 10 Nov 06:45 | 13 | 21,485 | - |
+| `realv7_001_prior` | 4 Nov 07:15 | 32 | 34,842 | 36,276 |
+| `real` | 30 Oct | LoopThr 1.0 | 26,318 | 27,046 |
+| `dataset_allsensor_realistic_map` | 6 Nov | LoopThr 1.0 | 51,539 | 51,539 |
+
+**It is not loop_closure:=false.** `real` and both sim mapping priors are
+closure-free and have full vocabularies. The discriminator is the build date:
+10 Nov 06:45 and earlier are intact, both 11 Nov 02:2x builds are not. Features
+were extracted normally in the broken builds (930 per node), so only the
+dictionary flush is missing. Mechanism undetermined without that session's log.
+
+Same symptom as the 6 Nov closure-free finding above, different cause, and the
+6 Nov fix cannot help: the vocabulary is absent from the file rather than
+suppressed at run time.
+
+`rtabmap.launch.py` now refuses `mode:=localize` when Word rows are under 20 % of
+the distinct word ids the features reference, printing both counts. Verified: it
+refuses `dataset_realv7_map` and admits `realv7_001_prior`.
+
+## relocalize:=false: dead reckoning on a prior map (11 Nov 2026)
+
+"Can I switch off the relocalize algorithm? Just using the initial pose and vslam
+pose." Yes, and it is the same mechanism as `loop_closure:=false`, which
+`mode:=localize` previously refused outright. Now expressed as its own argument so
+the intent is legible, on `rtabmap.launch.py` and threaded through
+`localize_{sim,real}` and `navigate_{sim,real}`, default `true`.
+
+`relocalize:=false` in localize mode sets `Rtabmap/LoopThr 1.0` and
+`RGBD/ProximityBySpace false`, so no hypothesis can be accepted and no correction
+is published. The pose becomes the `start_pose` seed composed with the front end's
+odometry; the prior's grid is still served from the database, so the planner is
+unaffected. Verified against the node's log: all three parameters arrive
+(`StartAtOrigin true`, `LoopThr 1.0`, `ProximityBySpace false`).
+
+Refused, because both would be silent mistakes: `start_pose:=last` (dead reckoning
+cannot recover from a wrong start, and that value is where the MAPPING run ended)
+and any mode other than localize.
+
+The vocabulary guard above is skipped in this mode, since nothing is matched. That
+makes the empty-vocabulary priors -- `dataset_realv7_map`, `dataset_realv8_map` --
+usable for dead-reckoned navigation even though they cannot be relocalised
+against. Verified.
+
+**What it costs.** Drift is unbounded and grows with distance travelled, because
+nothing bounds the front end any more. And the pose gate stops being a soundness
+check: with no corrections `corr_step_m` is always 0.000, so the stability test
+passes trivially and only the map-extent test still does anything. A run in this
+mode is not a localisation result and must not be quoted as one; it is, however, a
+clean A/B against the relocalising configuration for the navigation experiment.
+
+## The startup jump was a LATCHED wrong correction (11 Nov 2026)
+
+Every large "warp" in every simulation navigation run traces to one event, and it
+is not aliasing, a sparse map, or acceptance thresholds. The correction's yaw
+column in `localize_aisle_fix_02.csv` shows it directly:
+
+    t= 17.0   corr yaw -152.9      latched during the unstable start
+    t= 22.0   corr yaw  +73.8      latched again, still wrong
+    t= 56.5   corr yaw   -0.2      correct; never moves again
+    t= 58.5 .. 115.0   yaw within 1 deg, steps of 2-40 cm
+
+Between 22 and 56.5 s the correction was FROZEN with 74 deg of yaw error. The
+pose was the front end's odometry rotated by that much, so it walked out to map
+x -34.9 (world x ~ +40, about 22 m beyond the shelving) before a correct
+localisation replaced it in a single 28.05 m step at 10.9 m/s. 17 of 65
+localisations were flagged outside the prior's extent. Covariance read 0.025
+throughout, i.e. confidently wrong.
+
+**Why the correction was wrong:** ORB-SLAM3 publishes a provisional orientation
+before its inertial state is valid, RTAB-Map localises against it and latches the
+result. Nothing downstream can undo a latched correction. Measured on
+`localize_aisle_fix_01.csv`: stationary for 139.6 s, heading change median
+57.9 deg per update with 44 swings over 45 deg; the moment the user drove, it
+locked to 165.3 deg and held within 0.3 deg for the rest of the run. The correct
+answer appeared intermittently while stationary (171.4, 166.3, 164.8, 160.8 deg)
+and could not be held.
+
+**Why `init_ignore_s` cannot fix it.** It is a timer; the instability lasted
+139.6 s in one run and ~5 s in another. The variable is MOTION, not time.
+
+**Fix, wired 11 Nov 2026.** `wait_for_imu_init` (already in `orbslam3_node`,
+default false, keyed on `Frame::HasVelocity()`) is now exposed by
+`localization_rtabmap.launch.py` and threaded through `localize_sim` and
+`navigate_sim`, where it defaults TRUE. The front end then publishes nothing
+until its inertial state is valid, so no correction can be latched from a
+provisional orientation. Verified on the live node: `True` by default, `False`
+when overridden. `orb_output_path` was added alongside it, so the sim front end
+writes `vio.csv` and its `imu_initialized` column makes the timing measurable
+instead of inferred.
+
+RISK, recorded in `slam_wrapper.hpp`: one bag exists where `HasVelocity()` never
+fired, which with this on would mean NO poses at all rather than late ones. That
+is why the default stays false in the warehouse launch and the switch is
+overridable.
+
+**Retracted.** The aisle-aliasing diagnosis of the same day was wrong: jump sizes
+matching rack pitch was coincidence, and 20 of 22 heading swings occurred with
+the correction UNCHANGED, which rules out relocalisation as their source.
+`optimize_max_error:=3.0` remains unevaluated -- no run since has been long
+enough or clean enough to judge it.
+
+## wait_for_imu_init was a LATCH; made stateless (11 Nov 2026)
+
+Wiring `wait_for_imu_init` fixed the first initialisation and exposed the next
+layer: ORB-SLAM3 RE-initialises, and the gate released permanently at the first
+success. From the published quaternions of `imuinit_01` (tilt = angle of body z
+from vertical; ~0 deg gravity-aligned, ~90 deg not):
+
+    NOT aligned  0.00-2.57 s    ALIGNED 2.57-3.07
+    NOT aligned  3.07-5.71      ALIGNED 5.71-6.24
+    NOT aligned  6.24-8.94      ALIGNED 8.94-9.47
+    NOT aligned  9.47-12.14     ALIGNED 12.14-12.64
+    NOT aligned 12.64-15.48     ALIGNED 15.48-70.82  (holds)
+
+Five initialisations on a ~2.7 s cycle, 274 of 1528 poses not gravity aligned,
+four tracking-loss events, `imu_initialization_time_s` 2.64. The latch released
+at 2.57 s and every later un-aligned pose was published; RTAB-Map localised
+against one and latched a correction with 73.8 deg of yaw error, which is the
+pose being visibly wrong in RViz for tens of seconds and then snapping.
+
+FIX: `slam_wrapper.cpp` dropped the `&& !imu_ready_` term, so `HasVelocity()` is
+tested on EVERY frame. It goes false again after a reset, which is the signal
+wanted. `imu_ready_` is kept as a has-ever-been-ready flag and no longer
+suppresses the test. Only `orbslam3_ros2` was rebuilt; `libORB_SLAM3.so` is
+untouched (4 Nov), so the `-march=native` ABI pairing is unaffected. Node starts,
+parameter still reads True.
+
+What the run before this change already showed, and should improve further:
+correction yaw settled to within 1.6 deg from t=49 and steps were centimetres for
+the remaining 60 s; the user's viewer overlay had ORB odometry on ground truth
+the whole way round including the U-turn. The only remaining >1 m step expected
+is the unavoidable identity-to-seed transition at startup (9.42 m here).
+
+Open, not chased: 615 queue_dropped_frames in that run. Not the cause of the
+heading problem, but a plausible trigger for the tracking losses that force the
+re-initialisations. Look at it after confirming the gate fix.
+
+## Aisle warping: acceptance thresholds do not separate true from false (12 Nov 2026)
+
+Five hand-driven runs, and the honest summary is that NONE of them are comparable
+with another: the launch file was edited between aisle_03 and aisle_04
+(`RGBD/MaxOdomCacheSize` changed under the runs, mtime 08:52:56, one minute after
+aisle_04 finished), aisle_05 changed two settings at once, and the route is driven
+by hand so it differs every time. What they do show:
+
+| settings | corrections/min | no-information poses | warps |
+|---|---|---|---|
+| defaults (imuinit_02) | - | - | 2, up to 15.7 m |
+| optimize_max_error 3.0 (aisle_03) | 11.9 | 1 of 108 | 0 |
+| optimize_max_error 3.0 (aisle_04) | 2.8 | 45 of 94 | 1, 6.1 m |
+| min_inliers 35 + distribution 0.08 (aisle_05) | 0.9 | **81 of 81** | 0 |
+
+aisle_05 had NO warps because it had no localisation at all: every pose carried
+covariance 3e4 and the only correction was the startup transition, which latched
+-122.9 deg of yaw for the whole 129 s run. Stopping the warps by stopping
+localisation is not a fix, and it is the same end state as a prior with no
+vocabulary.
+
+**The finding.** The true matches in these aisles are weak enough that a threshold
+strict enough to reject a lookalike bay also rejects them. Covariance cannot
+screen either: the false match in aisle_04 came back at 0.0048 against 0.106 for
+the honest ones, twenty times MORE confident while being wrong, with the front end
+parked (tilt < 0.4 deg, |dyaw| 0.00 deg median, speed 0.01 m/s). So the warp is
+unambiguously the back end accepting a wrong place, not the front end drifting.
+
+`RGBD/OptimizeMaxError` is the wrong instrument for it: it judges consistency with
+the graph, and a lookalike bay is consistent, merely wrong. Tightening it 10.0 ->
+3.0 did not reliably stop warps and pushed the startup transient from 27 s to
+68 s, because the same test also delays the first CORRECT fix.
+
+**Exposed** on `rtabmap.launch.py`, threaded through all four entry points, all
+defaulting to RTAB-Map's own values so nothing changes unless passed: `min_inliers`
+(Vis/MinInliers, was 20 hard default), `min_inliers_distribution`
+(Vis/MinInliersDistribution, 0 = disabled; the one test aimed at a match bunched
+on repeating structure) and `odom_cache_size` (RGBD/MaxOdomCacheSize, lifted out
+of `_mode_params` where it was hard-coded). Verified all three reach the node.
+
+**Next:** `script/aisle_sweep.py`, one factor changed per variant from the
+defaults, writing a manifest beside each run (settings, command, git commit) so a
+result can never again be attributed to the wrong configuration. It cannot control
+the hand-driven route; `--analyse` flags any run whose path length differs from
+the median by over 20 %, and reports corrections/min and no-information poses
+beside the warp count, so "fixed it by going blind" is visible rather than
+mistaken for success.
